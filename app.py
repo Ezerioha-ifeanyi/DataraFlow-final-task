@@ -32,7 +32,6 @@ def perform_nlp_and_visualize(file_path: str) -> str:
         df = pd.read_csv(file_path)
         results = {"status": "success", "visualizations_saved": []}
 
-        # 1. Rating Distribution Plot
         if 'reviews.rating' in df.columns:
             plt.figure(figsize=(6, 4))
             sns.countplot(data=df, x='reviews.rating', palette='viridis')
@@ -44,12 +43,10 @@ def perform_nlp_and_visualize(file_path: str) -> str:
         if 'reviews.text' in df.columns:
             text_data = df['reviews.text'].dropna().astype(str)
             
-            # 2. Sentiment Analysis
             df['polarity'] = text_data.apply(lambda x: TextBlob(x).sentiment.polarity)
             results["average_sentiment_polarity"] = round(df['polarity'].mean(), 3)
             results["percent_negative_sentiment"] = round((df['polarity'] < 0).mean() * 100, 1)
 
-            # 3. Word Cloud
             text_combined = ' '.join(text_data)
             wordcloud = WordCloud(width=600, height=300, background_color='white').generate(text_combined)
             plt.figure(figsize=(8, 4))
@@ -60,7 +57,6 @@ def perform_nlp_and_visualize(file_path: str) -> str:
             plt.close()
             results["visualizations_saved"].append("word_cloud.png")
 
-            # 4. Topic Modeling
             vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
             tfidf = vectorizer.fit_transform(text_data)
             lda = LatentDirichletAllocation(n_components=3, random_state=42)
@@ -185,9 +181,9 @@ class Orchestrator:
         self.deployment = deployment
         self.logs = []
         self.report = {}
+        self.raw_nlp_context = ""
 
     def _safe_parse(self, text: str, agent_name: str) -> dict:
-        """Safely extracts JSON from LLM output, stripping markdown fences."""
         try:
             text = text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
             return json.loads(text)
@@ -201,27 +197,17 @@ class Orchestrator:
             if progress_callback:
                 progress_callback(step / total, label)
 
-        # Agent 1: Data Loader
         _progress(1, 3, "Data Analyst is summarizing the dataset...")
-        data_agent = Agent(
-            "DataLoader", "Data Analyst",
-            "You are a Data Analyst. Use tools to load the dataset and provide a brief statistical summary.",
-            self.client, self.deployment, [tools_schema[0]]
-        )
+        data_agent = Agent("DataLoader", "Data Analyst", "You are a Data Analyst. Use tools to load the dataset and provide a brief statistical summary.", self.client, self.deployment, [tools_schema[0]])
         data_summary = data_agent.run(f"Summarize the dataset at '{self.file_path}'.")
         self.logs.extend(data_agent.logs)
 
-        # Agent 2: NLP Specialist
         _progress(2, 3, "NLP Specialist is running ML models and generating charts...")
-        nlp_agent = Agent(
-            "NLPSpecialist", "Data Scientist",
-            "You are an NLP Specialist. Use the 'perform_nlp_and_visualize' tool to analyze sentiments and extract topics. Summarize the findings clearly.",
-            self.client, self.deployment, [tools_schema[1]]
-        )
+        nlp_agent = Agent("NLPSpecialist", "Data Scientist", "You are an NLP Specialist. Use the 'perform_nlp_and_visualize' tool to analyze sentiments and extract topics. Summarize the findings clearly.", self.client, self.deployment, [tools_schema[1]])
         nlp_output = nlp_agent.run(f"Run NLP analysis for '{self.file_path}'. Context: {data_summary}")
         self.logs.extend(nlp_agent.logs)
+        self.raw_nlp_context = nlp_output 
 
-        # Agent 3: Report Generator (Strict JSON schema)
         _progress(3, 3, "Product Manager is compiling the final JSON report...")
         report_agent = Agent(
             "ReportGenerator", "Product Manager",
@@ -247,28 +233,36 @@ class Orchestrator:
         return self.report
 
 # ==========================================
-# 4. STREAMLIT UI (Dashboard & Tabs)
+# 4. STREAMLIT UI & CHAT INTERFACE
 # ==========================================
 def main():
     st.set_page_config(page_title="Review Intelligence", layout="wide", page_icon="🛒")
 
+    # --- Session State Initialization ---
+    if "report" not in st.session_state: st.session_state.report = None
+    if "nlp_context" not in st.session_state: st.session_state.nlp_context = ""
+    if "chat_history" not in st.session_state: st.session_state.chat_history = []
+    if "client" not in st.session_state: st.session_state.client = None
+    if "deployment" not in st.session_state: st.session_state.deployment = "gpt-4o"
+    if "logs" not in st.session_state: st.session_state.logs = []
+
     # --- Sidebar Configuration ---
-    st.sidebar.title("⚙️ Azure Configuration")
-    azure_endpoint = st.sidebar.text_input("Azure Endpoint", value=os.getenv("AZURE_OPENAI_ENDPOINT", ""))
-    azure_key = st.sidebar.text_input("API Key", value=os.getenv("AZURE_OPENAI_API_KEY", ""), type="password")
-    deployment = st.sidebar.text_input("Deployment Name", value=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4"))
-    
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**Pipeline Architecture:**\n1. DataLoader\n2. NLPSpecialist\n3. BusinessInsightAgent")
+    with st.sidebar:
+        st.title("⚙️ Azure Configuration")
+        azure_endpoint = st.text_input("Azure Endpoint", value=os.getenv("AZURE_OPENAI_ENDPOINT", ""))
+        azure_key = st.text_input("API Key", value=os.getenv("AZURE_OPENAI_API_KEY", ""), type="password")
+        deployment = st.text_input("Deployment Name", value=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o"))
+        st.markdown("---")
+        st.markdown("**Agents Deployed:**\n1. DataLoader\n2. NLPSpecialist\n3. BusinessInsightAgent")
 
     # --- Main Page ---
     st.title("🛒 E-Commerce Review Intelligence")
-    st.markdown("Multi-Agent ML Pipeline with NLP Topic Modeling & Sentiment Analysis")
+    st.markdown("Multi-Agent ML Pipeline with NLP Topic Modeling & Interactive Chat")
 
     uploaded_file = st.file_uploader("Upload Amazon Reviews CSV", type=["csv"])
 
     if uploaded_file is not None:
-        temp_path = "amazon_reviews.csv"
+        temp_path = "temp_dataset.csv"
         with open(temp_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
         
@@ -286,68 +280,122 @@ def main():
                 api_key=azure_key,
                 api_version="2024-02-15-preview"
             )
+            
+            # Save client to session state for the chat feature
+            st.session_state.client = client
+            st.session_state.deployment = deployment
 
             progress_bar = st.progress(0, text="Initializing...")
-            
-            def _update_progress(fraction, label):
-                progress_bar.progress(fraction, text=label)
+            def _update_progress(fraction, label): progress_bar.progress(fraction, text=label)
 
             orchestrator = Orchestrator(temp_path, client, deployment)
             report = orchestrator.run(progress_callback=_update_progress)
             
-            progress_bar.progress(1.0, text="✅ Pipeline complete!")
+            # Save results to session state
+            st.session_state.report = report
+            st.session_state.nlp_context = orchestrator.raw_nlp_context
+            st.session_state.logs = orchestrator.logs
+            st.session_state.chat_history = [] # Reset chat history on new run
             
-            # --- Render Dashboard ---
-            if report:
+            progress_bar.progress(1.0, text="✅ Pipeline complete!")
+
+    # --- Render Dashboard (Only if report exists in session state) ---
+    if st.session_state.report:
+        report = st.session_state.report
+        st.markdown("---")
+        st.info(report.get("executive_summary", "Analysis complete."))
+        
+        stats = report.get("headline_stats", {})
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Reviews Analyzed", f"{stats.get('total_reviews', 'N/A'):,}")
+        col2.metric("Average Rating", f"{stats.get('average_rating', 'N/A')} / 5.0")
+        col3.metric("Negative Sentiment", f"{stats.get('negative_sentiment_pct', 'N/A')}%")
+        
+        st.markdown("---")
+        
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Visualizations", "🎯 Action Plan", "📄 JSON Report", "🖥️ Agent Logs"])
+        
+        with tab1:
+            c1, c2 = st.columns(2)
+            if os.path.exists("rating_distribution.png"): c1.image("rating_distribution.png", use_column_width=True)
+            if os.path.exists("word_cloud.png"): c2.image("word_cloud.png", use_column_width=True)
+            st.subheader("Extracted Themes (LDA Modeling)")
+            for t in report.get("extracted_themes", []):
+                st.markdown(f"**{t.get('theme_name', 'Theme')}**: {', '.join(t.get('keywords', []))}")
+
+        with tab2:
+            st.subheader("Recommended Business Interventions")
+            for item in report.get("business_interventions", []):
+                priority = item.get("priority", "medium").lower()
+                icon = {"high": "🔴", "medium": "🟡", "low": "🔵"}.get(priority, "⚪")
+                st.markdown(f"### {icon} {priority.upper()} PRIORITY")
+                st.markdown(f"**Action:** {item.get('action', '')}")
+                st.markdown(f"**Rationale:** {item.get('rationale', '')}")
                 st.markdown("---")
-                
-                # 1. Executive Summary & Metrics
-                st.info(report.get("executive_summary", "Analysis complete."))
-                
-                stats = report.get("headline_stats", {})
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Total Reviews Analyzed", f"{stats.get('total_reviews', len(df_preview)):,}")
-                col2.metric("Average Rating", f"{stats.get('average_rating', 'N/A')} / 5.0")
-                col3.metric("Negative Sentiment", f"{stats.get('negative_sentiment_pct', 'N/A')}%")
-                
-                st.markdown("---")
-                
-                # 2. Tabbed Interface
-                tab1, tab2, tab3, tab4 = st.tabs(["📊 Visualizations", "🎯 Action Plan", "📄 JSON Report", "🖥️ Agent Logs"])
-                
-                with tab1:
-                    c1, c2 = st.columns(2)
-                    if os.path.exists("rating_distribution.png"):
-                        c1.image("rating_distribution.png", use_column_width=True)
-                    if os.path.exists("word_cloud.png"):
-                        c2.image("word_cloud.png", use_column_width=True)
-                        
-                    st.subheader("Extracted Themes (LDA Modeling)")
-                    themes = report.get("extracted_themes", [])
-                    for t in themes:
-                        st.markdown(f"**{t.get('theme_name', 'Theme')}**: {', '.join(t.get('keywords', []))}")
 
-                with tab2:
-                    st.subheader("Recommended Business Interventions")
-                    for item in report.get("business_interventions", []):
-                        priority = item.get("priority", "medium").lower()
-                        icon = {"high": "🔴", "medium": "🟡", "low": "🔵"}.get(priority, "⚪")
-                        st.markdown(f"### {icon} {priority.upper()} PRIORITY")
-                        st.markdown(f"**Action:** {item.get('action', '')}")
-                        st.markdown(f"**Rationale:** {item.get('rationale', '')}")
-                        st.markdown("---")
+        with tab3: st.json(report)
 
-                with tab3:
-                    st.json(report)
+        with tab4:
+            for log in st.session_state.logs:
+                if "Error" in log or "WARNING" in log: st.error(log)
+                elif "complete" in log: st.success(log)
+                else: st.text(log)
+        
+        # --- Interactive Chat Interface ---
+        st.markdown("---")
+        st.subheader("💬 Ask the Insights Agent")
+        st.markdown("Ask anything about the customer sentiments, themes, or recommended actions.")
 
-                with tab4:
-                    for log in orchestrator.logs:
-                        if "Error" in log or "WARNING" in log:
-                            st.error(log)
-                        elif "complete" in log:
-                            st.success(log)
-                        else:
-                            st.text(log)
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
+
+        user_input = st.chat_input("e.g. Why is the negative sentiment percentage so high?")
+
+        if user_input:
+            st.session_state.chat_history.append({"role": "user", "content": user_input})
+            with st.chat_message("user"):
+                st.write(user_input)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Analyzing context..."):
+                    system_prompt = f"""You are a brilliant E-commerce Product Strategist. 
+Use the following context from our multi-agent analysis to answer the user's questions.
+
+NLP Analysis Context:
+{st.session_state.nlp_context}
+
+Final Structured Report:
+{json.dumps(st.session_state.report, indent=2)}
+
+Be concise, strategic, and practical. Reference the data directly."""
+
+                    messages = [{"role": "system", "content": system_prompt}]
+                    for msg in st.session_state.chat_history:
+                        messages.append({"role": msg["role"], "content": msg["content"]})
+
+                    try:
+                        resp = st.session_state.client.chat.completions.create(
+                            model=st.session_state.deployment,
+                            messages=messages,
+                            max_tokens=500,
+                            temperature=0.4
+                        )
+                        answer = resp.choices[0].message.content
+                    except Exception as e:
+                        answer = f"Error connecting to AI: {e}"
+
+                    st.write(answer)
+                    st.session_state.chat_history.append({"role": "assistant", "content": answer})
+
+    elif st.session_state.logs and not st.session_state.report:
+        st.error("🚨 The pipeline finished, but the final report was empty. Please check the logs below to see where the API failed.")
+        st.subheader("🖥️ Error Logs")
+        for log in st.session_state.logs:
+            if "Error" in log or "WARNING" in log:
+                st.error(log)
+            else:
+                st.text(log)
 
 if __name__ == "__main__":
     main()
