@@ -268,7 +268,7 @@ def main():
     uploaded_file = st.file_uploader("Upload Amazon Reviews CSV", type=["csv"])
 
     if uploaded_file is not None:
-        temp_path = "temp_dataset.csv"
+        temp_path = "amazon_reviews.csv"
         with open(temp_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
         
