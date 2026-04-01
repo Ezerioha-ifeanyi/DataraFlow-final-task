@@ -1,3 +1,4 @@
+%%writefile app.py
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -13,9 +14,28 @@ from sklearn.decomposition import LatentDirichletAllocation
 from openai import AzureOpenAI
 
 # ==========================================
-# 1. CUSTOM TOOLS (Data Science & NLP)
+# 1. CUSTOM TOOLS (Validation, Data Science & NLP)
 # ==========================================
+def validate_dataset(file_path: str) -> str:
+    """Tool 1: Validates the health of the dataset (missing values, duplicates)."""
+    try:
+        df = pd.read_csv(file_path)
+        required_cols = ['reviews.rating', 'reviews.text']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        
+        health_report = {
+            "total_rows": len(df),
+            "duplicate_rows": int(df.duplicated().sum()),
+            "missing_required_columns": missing_cols,
+            "null_values": {col: int(df[col].isnull().sum()) for col in required_cols if col in df.columns},
+            "status": "FAIL" if missing_cols else "PASS"
+        }
+        return json.dumps(health_report)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
 def summarize_dataset(file_path: str) -> str:
+    """Tool 2: Reads the dataset and returns a statistical summary."""
     try:
         df = pd.read_csv(file_path)
         summary = {
@@ -28,13 +48,14 @@ def summarize_dataset(file_path: str) -> str:
         return json.dumps({"error": str(e)})
 
 def perform_nlp_and_visualize(file_path: str) -> str:
+    """Tool 3: Performs sentiment analysis, topic modeling, and saves visualizations."""
     try:
         df = pd.read_csv(file_path)
         results = {"status": "success", "visualizations_saved": []}
 
         if 'reviews.rating' in df.columns:
             plt.figure(figsize=(6, 4))
-            sns.countplot(data=df, x='reviews.rating', palette='viridis')
+            sns.countplot(data=df, x='reviews.rating', hue='reviews.rating', legend=False, palette='viridis')
             plt.title('Distribution of Customer Ratings')
             plt.savefig('rating_distribution.png', bbox_inches='tight')
             plt.close()
@@ -73,6 +94,7 @@ def perform_nlp_and_visualize(file_path: str) -> str:
         return json.dumps({"error": str(e), "traceback": traceback.format_exc()})
 
 AVAILABLE_TOOLS = {
+    "validate_dataset": validate_dataset,
     "summarize_dataset": summarize_dataset,
     "perform_nlp_and_visualize": perform_nlp_and_visualize
 }
@@ -81,13 +103,17 @@ tools_schema = [
     {
         "type": "function",
         "function": {
+            "name": "validate_dataset",
+            "description": "Checks the dataset for missing values, duplicates, and schema health.",
+            "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "summarize_dataset",
             "description": "Get basic stats from the dataset.",
-            "parameters": {
-                "type": "object",
-                "properties": {"file_path": {"type": "string"}},
-                "required": ["file_path"]
-            }
+            "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}
         }
     },
     {
@@ -95,11 +121,7 @@ tools_schema = [
         "function": {
             "name": "perform_nlp_and_visualize",
             "description": "Runs NLP algorithms to extract topics, calculates sentiment, and saves visualization images.",
-            "parameters": {
-                "type": "object",
-                "properties": {"file_path": {"type": "string"}},
-                "required": ["file_path"]
-            }
+            "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}
         }
     }
 ]
@@ -172,7 +194,7 @@ class Agent:
         return f"Agent '{self.name}' reached maximum iterations."
 
 # ==========================================
-# 3. ORCHESTRATOR CLASS
+# 3. ORCHESTRATOR CLASS (The 5-Agent Pipeline)
 # ==========================================
 class Orchestrator:
     def __init__(self, file_path: str, client: AzureOpenAI, deployment: str):
@@ -197,23 +219,32 @@ class Orchestrator:
             if progress_callback:
                 progress_callback(step / total, label)
 
-        _progress(1, 3, "Data Analyst is summarizing the dataset...")
-        data_agent = Agent("DataLoader", "Data Analyst", "You are a Data Analyst. Use tools to load the dataset and provide a brief statistical summary.", self.client, self.deployment, [tools_schema[0]])
-        data_summary = data_agent.run(f"Summarize the dataset at '{self.file_path}'.")
+        # Agent 1: Data Validator
+        _progress(1, 5, "QA Engineer is validating dataset health...")
+        validator_agent = Agent("DataValidator", "QA Engineer", "You are a Data Quality Engineer. Check the dataset for missing values and duplicates. Report the health status.", self.client, self.deployment, [tools_schema[0]])
+        validation_status = validator_agent.run(f"Validate the dataset at '{self.file_path}'.")
+        self.logs.extend(validator_agent.logs)
+
+        # Agent 2: Data Analyst
+        _progress(2, 5, "Data Analyst is summarizing the dataset...")
+        data_agent = Agent("DataLoader", "Data Analyst", "You are a Data Analyst. Read the dataset and provide a brief statistical summary.", self.client, self.deployment, [tools_schema[1]])
+        data_summary = data_agent.run(f"Summarize the dataset at '{self.file_path}'. Here is the validation context: {validation_status}")
         self.logs.extend(data_agent.logs)
 
-        _progress(2, 3, "NLP Specialist is running ML models and generating charts...")
-        nlp_agent = Agent("NLPSpecialist", "Data Scientist", "You are an NLP Specialist. Use the 'perform_nlp_and_visualize' tool to analyze sentiments and extract topics. Summarize the findings clearly.", self.client, self.deployment, [tools_schema[1]])
+        # Agent 3: NLP Specialist
+        _progress(3, 5, "NLP Specialist is extracting themes and sentiments...")
+        nlp_agent = Agent("NLPSpecialist", "Data Scientist", "You are an NLP Specialist. Use the 'perform_nlp_and_visualize' tool to analyze sentiments and extract topics.", self.client, self.deployment, [tools_schema[2]])
         nlp_output = nlp_agent.run(f"Run NLP analysis for '{self.file_path}'. Context: {data_summary}")
         self.logs.extend(nlp_agent.logs)
         self.raw_nlp_context = nlp_output 
 
-        _progress(3, 3, "Product Manager is compiling the final JSON report...")
+        # Agent 4: Report Generator (Draft)
+        _progress(4, 5, "Product Manager is drafting the initial report...")
         report_agent = Agent(
             "ReportGenerator", "Product Manager",
             textwrap.dedent("""
             You are a Product Manager. Based on the data summary and NLP analysis provided, 
-            generate a final strategic report. You MUST return ONLY a JSON object matching this exact schema:
+            generate a draft strategic report. You MUST return ONLY a JSON object matching this exact schema:
             {
               "headline_stats": {"total_reviews": <int>, "average_rating": <float>, "negative_sentiment_pct": <float>},
               "extracted_themes": [{"theme_name": <str>, "keywords": [<str>, ...]}, ...],
@@ -226,10 +257,26 @@ class Orchestrator:
             """),
             self.client, self.deployment, None
         )
-        report_raw = report_agent.run(f"Data:\n{data_summary}\n\nNLP:\n{nlp_output}")
+        draft_report = report_agent.run(f"Validation:\n{validation_status}\n\nData:\n{data_summary}\n\nNLP:\n{nlp_output}")
         self.logs.extend(report_agent.logs)
+
+        # Agent 5: Feedback & Review Agent (Final Output)
+        _progress(5, 5, "Senior Strategy Director is reviewing and finalizing the report...")
+        feedback_agent = Agent(
+            "FeedbackAgent", "Senior Director",
+            textwrap.dedent("""
+            You are a Senior Strategy Director. Review the draft JSON report below.
+            1. Ensure the interventions are directly supported by the NLP themes.
+            2. Remove any 'hallucinations' (claims not supported by the data).
+            3. Ensure the JSON schema is perfectly intact.
+            Return ONLY the final, polished JSON object. No markdown fences.
+            """),
+            self.client, self.deployment, None
+        )
+        final_report_raw = feedback_agent.run(f"Original Context:\n{nlp_output}\n\nDraft Report:\n{draft_report}")
+        self.logs.extend(feedback_agent.logs)
         
-        self.report = self._safe_parse(report_raw, "ReportGenerator")
+        self.report = self._safe_parse(final_report_raw, "FeedbackAgent")
         return self.report
 
 # ==========================================
@@ -238,7 +285,6 @@ class Orchestrator:
 def main():
     st.set_page_config(page_title="Review Intelligence", layout="wide", page_icon="🛒")
 
-    # --- Session State Initialization ---
     if "report" not in st.session_state: st.session_state.report = None
     if "nlp_context" not in st.session_state: st.session_state.nlp_context = ""
     if "chat_history" not in st.session_state: st.session_state.chat_history = []
@@ -246,18 +292,16 @@ def main():
     if "deployment" not in st.session_state: st.session_state.deployment = "gpt-4o"
     if "logs" not in st.session_state: st.session_state.logs = []
 
-    # --- Sidebar Configuration ---
     with st.sidebar:
         st.title("⚙️ Azure Configuration")
         azure_endpoint = st.text_input("Azure Endpoint", value=os.getenv("AZURE_OPENAI_ENDPOINT", ""))
         azure_key = st.text_input("API Key", value=os.getenv("AZURE_OPENAI_API_KEY", ""), type="password")
         deployment = st.text_input("Deployment Name", value=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o"))
         st.markdown("---")
-        st.markdown("**Agents Deployed:**\n1. DataLoader\n2. NLPSpecialist\n3. BusinessInsightAgent")
+        st.markdown("**Agents Deployed:**\n1. DataValidator (QA)\n2. DataLoader\n3. NLPSpecialist\n4. BusinessInsightAgent\n5. FeedbackAgent (Reviewer)")
 
-    # --- Main Page ---
     st.title("🛒 E-Commerce Review Intelligence")
-    st.markdown("Multi-Agent ML Pipeline with NLP Topic Modeling & Interactive Chat")
+    st.markdown("Multi-Agent ML Pipeline with Validation, Reflection, and NLP Topic Modeling.")
 
     uploaded_file = st.file_uploader("Upload Amazon Reviews CSV", type=["csv"])
 
@@ -281,7 +325,6 @@ def main():
                 api_version="2024-02-15-preview"
             )
             
-            # Save client to session state for the chat feature
             st.session_state.client = client
             st.session_state.deployment = deployment
 
@@ -291,15 +334,13 @@ def main():
             orchestrator = Orchestrator(temp_path, client, deployment)
             report = orchestrator.run(progress_callback=_update_progress)
             
-            # Save results to session state
             st.session_state.report = report
             st.session_state.nlp_context = orchestrator.raw_nlp_context
             st.session_state.logs = orchestrator.logs
-            st.session_state.chat_history = [] # Reset chat history on new run
+            st.session_state.chat_history = [] 
             
             progress_bar.progress(1.0, text="✅ Pipeline complete!")
 
-    # --- Render Dashboard (Only if report exists in session state) ---
     if st.session_state.report:
         report = st.session_state.report
         st.markdown("---")
@@ -341,7 +382,6 @@ def main():
                 elif "complete" in log: st.success(log)
                 else: st.text(log)
         
-        # --- Interactive Chat Interface ---
         st.markdown("---")
         st.subheader("💬 Ask the Insights Agent")
         st.markdown("Ask anything about the customer sentiments, themes, or recommended actions.")
